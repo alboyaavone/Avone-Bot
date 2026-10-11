@@ -1,4 +1,4 @@
-import sqlite3, discord, asyncio, os, re, pathlib, aiohttp
+import sqlite3, discord, asyncio, os, re, pathlib, aiohttp, io
 from discord.ext import commands
 from discord.ui import View, Button
 from collections import defaultdict
@@ -33,6 +33,7 @@ VOICE_ALWAYS_ON          = True
 SPAM_MAX=5; SPAM_INTERVAL=3; SPAM_TIMEOUT=300; MENTION_MAX=3; CREATE_MAX=3; CREATE_WIN=15
 PING_MAX=2; PING_WINDOW=5
 INVITE_RE = re.compile(r"(discord\.gg|discord\.com/invite)/\S+", re.IGNORECASE)
+LINK_RE   = re.compile(r"(https?://\S+|www\.\S+\.\S+)", re.IGNORECASE)  # any link, used by the @everyone+link rule below
 # Kept for backwards compatibility — real whitelist now lives in the sec_whitelist DB table (per guild).
 SECURITY_WHITELIST_USERS: set[int] = set()
 SECURITY_WHITELIST_ROLES: set[int] = set()
@@ -40,7 +41,7 @@ SECURITY_MODULES = [
     "anti_spam","anti_mention","anti_invite","anti_webhook",
     "anti_channel_delete","anti_channel_create","anti_role_delete","anti_role_create",
     "anti_mass_ban","anti_mass_kick","anti_mass_timeout","anti_admin_perm","new_account_warn",
-    "anti_mass_ping","anti_bot_add",
+    "anti_mass_ping","anti_bot_add","anti_everyone_link",
 ]
 
 # ================================================================
@@ -67,6 +68,7 @@ SEC_PUNISHMENT_DEFAULTS = {
     "webhook":     "ban",
     "admin_perm":  "ban",          # wer Admin an eine Rolle vergibt, wird gebannt (Admin wird zusätzlich sofort entfernt)
     "bot_add":     "kick",
+    "everyone_link":"clear_roles", # @everyone/@here + Link in einer Nachricht -> sofort Rollen weg (unabhängig vom Mass-Ping Zähler)
 }
 SEC_PUNISHMENT_LABELS = {
     "spam":        "Spam (zu viele Nachrichten)",
@@ -82,6 +84,7 @@ SEC_PUNISHMENT_LABELS = {
     "webhook":     "Webhook-Angriff",
     "admin_perm":  "Admin-Perm vergeben",
     "bot_add":     "Bot hinzugefügt (unerlaubt)",
+    "everyone_link":"@everyone/@here + Link in einer Nachricht",
 }
 VALID_PUNISHMENTS = ["none", "clear_roles", "timeout", "kick", "ban"]
 
@@ -907,6 +910,23 @@ async def on_message(message:discord.Message):
         except: pass
         return
 
+    # @everyone/@here + a link in the SAME message -> immediate punishment.
+    # This is separate from (and doesn't change) the existing mass-ping
+    # threshold rule below — it fires on the very first offending message,
+    # regardless of how many times someone has pinged recently.
+    if (_sec(g.id,"anti_everyone_link") and not whitelisted(message.author, g)
+            and ("@everyone" in message.content or "@here" in message.content)
+            and LINK_RE.search(message.content)):
+        try: await message.delete()
+        except: pass
+        m = g.get_member(message.author.id)
+        if m:
+            await _execute_punishment(g, m, "everyone_link", "@everyone/@here mit Link in derselben Nachricht")
+        await mlog(g,"Auto-Strafe (@everyone + Link)",
+            f"{message.author} ({message.author.id}) hat @everyone/@here zusammen mit einem Link gesendet — "
+            f"Nachricht gelöscht, Rollen entfernt.")
+        return
+
     # Auto-responses: bot replies (native Discord reply — pings without
     # spelling out "@user") to configured trigger words, e.g. "hi"/"hallo".
     _trigger = message.content.strip().lower().strip(" !.,?")
@@ -1355,6 +1375,7 @@ class ConfigMainView(discord.ui.View):
             discord.SelectOption(label="Auto-Rolle",         value="AUTO_ROLE_ID",         description="Automatisch zugewiesene Rolle beim Beitritt."),
             discord.SelectOption(label="Trigger-Rolle",      value="TRIGGER_ROLE_ID",      description="Rolle, die weitere Rollen auslöst."),
             discord.SelectOption(label="Timeout-Rolle",      value="TIMEOUT_ROLE_ID",      description="Rolle mit Timeout-Berechtigung."),
+            discord.SelectOption(label="Rollen-Vergabe-Rolle", value="ROLE_CMD_ALLOWED_ROLE_ID", description="Rolle, die ?role/­/role benutzen darf."),
             discord.SelectOption(label="Willkommensnachricht", value="WELCOME_MSG",        description="Willkommensnachricht bearbeiten."),
             discord.SelectOption(label="Boost-Nachricht",    value="BOOST_MSG",            description="Boost-Nachricht bearbeiten."),
         ],
@@ -1363,7 +1384,7 @@ class ConfigMainView(discord.ui.View):
     async def select_callback(self, interaction: discord.Interaction, select: discord.ui.Select):
         key = select.values[0]
         channel_keys = {"WELCOME_CHANNEL_ID":("Willkommens-Kanal",[discord.ChannelType.text]),"LOG_CHANNEL_ID":("Log-Kanal",[discord.ChannelType.text]),"RULES_CHANNEL_ID":("Regeln-Kanal",[discord.ChannelType.text]),"BOOST_CHANNEL_ID":("Boost-Kanal",[discord.ChannelType.text]),"INVITE_CHANNEL_ID":("Invite-Kanal",[discord.ChannelType.text])}
-        role_keys = {"AUTO_ROLE_ID":"Auto-Rolle","TRIGGER_ROLE_ID":"Trigger-Rolle","TIMEOUT_ROLE_ID":"Timeout-Rolle"}
+        role_keys = {"AUTO_ROLE_ID":"Auto-Rolle","TRIGGER_ROLE_ID":"Trigger-Rolle","TIMEOUT_ROLE_ID":"Timeout-Rolle","ROLE_CMD_ALLOWED_ROLE_ID":"Rollen-Vergabe-Rolle"}
         message_keys = {"WELCOME_MSG":"Willkommensnachricht","BOOST_MSG":"Boost-Nachricht"}
 
         if key in channel_keys:
@@ -1400,7 +1421,7 @@ class ConfigMainView(discord.ui.View):
 
 async def _return_to_config(interaction: discord.Interaction, notice: str = ""):
     g = interaction.guild
-    ids = {k: _cid(g.id, k) for k in ["WELCOME_CHANNEL_ID","LOG_CHANNEL_ID","RULES_CHANNEL_ID","BOOST_CHANNEL_ID","INVITE_CHANNEL_ID","AUTO_ROLE_ID","TRIGGER_ROLE_ID","TIMEOUT_ROLE_ID"]}
+    ids = {k: _cid(g.id, k) for k in ["WELCOME_CHANNEL_ID","LOG_CHANNEL_ID","RULES_CHANNEL_ID","BOOST_CHANNEL_ID","INVITE_CHANNEL_ID","AUTO_ROLE_ID","TRIGGER_ROLE_ID","TIMEOUT_ROLE_ID","ROLE_CMD_ALLOWED_ROLE_ID"]}
     def ch(k): return f"<#{ids[k]}>" if ids[k] else "Nicht konfiguriert"
     def ro(k): return f"<@&{ids[k]}>" if ids[k] else "Nicht konfiguriert"
     desc = ((f"{notice}\n\n" if notice else "") + "Bot-Einstellungen über das Menü konfigurieren.\n\n"
@@ -1413,6 +1434,7 @@ async def _return_to_config(interaction: discord.Interaction, notice: str = ""):
                 f"**Auto-Rolle** — {ro('AUTO_ROLE_ID')}",
                 f"**Trigger-Rolle** — {ro('TRIGGER_ROLE_ID')}",
                 f"**Timeout-Rolle** — {ro('TIMEOUT_ROLE_ID')}",
+                f"**Rollen-Vergabe-Rolle** — {ro('ROLE_CMD_ALLOWED_ROLE_ID')}",
             ]))
     embed = discord.Embed(title="Bot-Konfiguration", description=desc, color=0x2B2D31)
     embed.set_footer(text=f"Von {interaction.user}", icon_url=interaction.user.display_avatar.url)
@@ -1433,7 +1455,7 @@ async def config_cmd(interaction: discord.Interaction):
     if interaction.user.id not in OWNERS:
         return await interaction.response.send_message("Keine Berechtigung.", ephemeral=True)
     g = interaction.guild
-    ids = {k: _cid(g.id, k) for k in ["WELCOME_CHANNEL_ID","LOG_CHANNEL_ID","RULES_CHANNEL_ID","BOOST_CHANNEL_ID","INVITE_CHANNEL_ID","AUTO_ROLE_ID","TRIGGER_ROLE_ID","TIMEOUT_ROLE_ID"]}
+    ids = {k: _cid(g.id, k) for k in ["WELCOME_CHANNEL_ID","LOG_CHANNEL_ID","RULES_CHANNEL_ID","BOOST_CHANNEL_ID","INVITE_CHANNEL_ID","AUTO_ROLE_ID","TRIGGER_ROLE_ID","TIMEOUT_ROLE_ID","ROLE_CMD_ALLOWED_ROLE_ID"]}
     def ch(k): return f"<#{ids[k]}>" if ids[k] else "Nicht konfiguriert"
     def ro(k): return f"<@&{ids[k]}>" if ids[k] else "Nicht konfiguriert"
     desc = ("Bot-Einstellungen über das Menü konfigurieren.\n\n"
@@ -1446,6 +1468,7 @@ async def config_cmd(interaction: discord.Interaction):
                 f"**Auto-Rolle** — {ro('AUTO_ROLE_ID')}",
                 f"**Trigger-Rolle** — {ro('TRIGGER_ROLE_ID')}",
                 f"**Timeout-Rolle** — {ro('TIMEOUT_ROLE_ID')}",
+                f"**Rollen-Vergabe-Rolle** — {ro('ROLE_CMD_ALLOWED_ROLE_ID')}",
             ]))
     embed = discord.Embed(title="Bot-Konfiguration", description=desc, color=0x2B2D31)
     embed.set_footer(text=f"Von {interaction.user}", icon_url=interaction.user.display_avatar.url)
@@ -1820,22 +1843,24 @@ def _assignable_roles(guild: discord.Guild, author: discord.Member) -> list[disc
             if r >= author.top_role: continue
         roles.append(r)
     roles.sort(key=lambda r: r.position, reverse=True)
-    return roles[:25]  # Discord select menus cap out at 25 options
+    return roles  # full list — the view slices to 25 for display / search narrows it further
 
 class RoleMultiSelect(discord.ui.Select):
-    def __init__(self, author_id: int, member: discord.Member, roles: list[discord.Role]):
+    """Toggles ALL selected roles at once (add if missing, remove if already
+    held) — you're not limited to one role per use."""
+    def __init__(self, roles: list[discord.Role], member: discord.Member):
         options=[discord.SelectOption(
             label=r.name[:100], value=str(r.id),
             description="Wird entfernt" if r in member.roles else "Wird hinzugefügt"
         ) for r in roles]
-        super().__init__(placeholder="Rollen auswählen (Hinzufügen/Entfernen toggeln)...",
+        super().__init__(placeholder="Rollen auswählen (Hinzufügen/Entfernen toggeln, Mehrfachauswahl möglich)...",
                           min_values=1, max_values=len(options), options=options)
-        self.author_id = author_id
-        self.member = member
 
     async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.author_id:
+        view: "RoleMultiSelectView" = self.view
+        if interaction.user.id != view.author.id:
             return await interaction.response.send_message("Dieses Menü ist nicht für dich.", ephemeral=True)
+        member = view.member
         added=[]; removed=[]; failed=[]
         for rid in self.values:
             role = interaction.guild.get_role(int(rid))
@@ -1847,33 +1872,88 @@ class RoleMultiSelect(discord.ui.Select):
             if role >= interaction.user.top_role and interaction.user.id not in OWNERS:
                 failed.append(f"{role.name} (höher/gleich deiner Rolle)"); continue
             try:
-                if role in self.member.roles:
-                    await self.member.remove_roles(role, reason=f"?role Menü von {interaction.user}")
+                if role in member.roles:
+                    await member.remove_roles(role, reason=f"?role Menü von {interaction.user}")
                     removed.append(role.name)
                 else:
-                    await self.member.add_roles(role, reason=f"?role Menü von {interaction.user}")
+                    await member.add_roles(role, reason=f"?role Menü von {interaction.user}")
                     added.append(role.name)
             except:
                 failed.append(role.name)
-        parts=[]
-        if added: parts.append("✅ Hinzugefügt: " + ", ".join(added))
-        if removed: parts.append("➖ Entfernt: " + ", ".join(removed))
-        if failed: parts.append("⚠️ Fehlgeschlagen: " + ", ".join(failed))
-        if self.view: self.view.stop()
-        await interaction.response.edit_message(content="\n".join(parts) or "Keine Änderung.", view=None)
         if added or removed:
             await mlog(interaction.guild, "Rollen Menü",
-                f"{interaction.user} hat für {self.member} Rollen angepasst — Hinzugefügt: {', '.join(added) or '—'} | Entfernt: {', '.join(removed) or '—'}")
+                f"{interaction.user} hat für {member} Rollen angepasst — Hinzugefügt: {', '.join(added) or '—'} | Entfernt: {', '.join(removed) or '—'}")
+        for n in added: view.log_lines.append(f"✅ Hinzugefügt: {n}")
+        for n in removed: view.log_lines.append(f"➖ Entfernt: {n}")
+        for n in failed: view.log_lines.append(f"⚠️ Fehlgeschlagen: {n}")
+        # Rebuild the view (same search filter) so the 60s timer resets and
+        # the menu stays open for further picks instead of closing after one.
+        view.stop()
+        new_view = RoleMultiSelectView(view.author, member, search=view.search, log_lines=view.log_lines)
+        content = ("\n".join(view.log_lines) or "Noch keine Änderung.") + "\n\nWeitere Rollen wählen, 🔍 suchen oder ✅ Fertig."
+        await interaction.response.edit_message(content=content, view=new_view)
+        new_view.message = interaction.message
+
+class RoleSearchModal(discord.ui.Modal, title="Rolle suchen"):
+    query = discord.ui.TextInput(label="Rollenname (oder Teil davon)", placeholder="z.B. Mod", required=True, max_length=100)
+
+    def __init__(self, parent_view: "RoleMultiSelectView"):
+        super().__init__()
+        self.parent_view = parent_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.parent_view.stop()
+        search = str(self.query.value).strip()
+        new_view = RoleMultiSelectView(self.parent_view.author, self.parent_view.member,
+                                        search=search, log_lines=self.parent_view.log_lines)
+        base = ("\n".join(new_view.log_lines) + "\n\n") if new_view.log_lines else ""
+        if not new_view.shown_roles:
+            content = base + f"Keine Rolle gefunden für „{search}“. Nochmal 🔍 suchen oder ✅ Fertig."
+        else:
+            content = base + f"Suchergebnisse für „{search}“ ({len(new_view.matching_roles)} Treffer) — Rollen auswählen:"
+        await interaction.response.edit_message(content=content, view=new_view)
+        new_view.message = interaction.message
+
+class RoleSearchButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="🔍 Suchen", style=discord.ButtonStyle.secondary, row=1)
+    async def callback(self, interaction: discord.Interaction):
+        view: "RoleMultiSelectView" = self.view
+        if interaction.user.id != view.author.id:
+            return await interaction.response.send_message("Dieses Menü ist nicht für dich.", ephemeral=True)
+        await interaction.response.send_modal(RoleSearchModal(view))
+
+class RoleFinishButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="✅ Fertig", style=discord.ButtonStyle.success, row=1)
+    async def callback(self, interaction: discord.Interaction):
+        view: "RoleMultiSelectView" = self.view
+        if interaction.user.id != view.author.id:
+            return await interaction.response.send_message("Dieses Menü ist nicht für dich.", ephemeral=True)
+        view.stop()
+        content = "\n".join(view.log_lines) or "Keine Änderung vorgenommen."
+        await interaction.response.edit_message(content=content, view=None)
 
 class RoleMultiSelectView(discord.ui.View):
-    """1-minute picker. If nobody picks anything in that time, the message
-    deletes itself instead of sitting around uselessly."""
-    def __init__(self, author: discord.Member, member: discord.Member):
+    """Stays open across multiple picks — every selection refreshes the 60s
+    timer instead of closing the menu. Includes a 🔍 search button (for role
+    lists longer than the 25 Discord shows at once) and a ✅ Fertig button to
+    close early. Left untouched for 60s -> the message deletes itself."""
+    def __init__(self, author: discord.Member, member: discord.Member,
+                 search: str = None, log_lines: list[str] = None):
         super().__init__(timeout=60)
         self.message: discord.Message | None = None
-        roles = _assignable_roles(author.guild, author)
-        if roles:
-            self.add_item(RoleMultiSelect(author.id, member, roles))
+        self.author = author
+        self.member = member
+        self.search = search
+        self.log_lines = log_lines if log_lines is not None else []
+        all_roles = _assignable_roles(author.guild, author)
+        self.matching_roles = [r for r in all_roles if search.lower() in r.name.lower()] if search else all_roles
+        self.shown_roles = self.matching_roles[:25]
+        if self.shown_roles:
+            self.add_item(RoleMultiSelect(self.shown_roles, member))
+        self.add_item(RoleSearchButton())
+        self.add_item(RoleFinishButton())
 
     async def on_timeout(self):
         if self.message:
@@ -1890,7 +1970,8 @@ async def role_cmd(ctx:commands.Context,member:discord.Member=None,*,role_input:
         if not assignable:
             return await clean(ctx,"Du hast keine Rollen, die du vergeben kannst.")
         view = RoleMultiSelectView(ctx.author, member)
-        msg = await ctx.send(f"Wähle die Rollen aus, die du für {member.mention} hinzufügen oder entfernen möchtest (läuft in 60s ab):", view=view)
+        note = f" ({len(assignable)} Rollen insgesamt — nutze 🔍 Suchen, falls eine fehlt)" if len(assignable) > 25 else ""
+        msg = await ctx.send(f"Wähle die Rollen aus, die du für {member.mention} hinzufügen oder entfernen möchtest{note}:", view=view)
         view.message = msg
         return
     matches=find_role(ctx.guild,role_input)
@@ -2199,7 +2280,8 @@ async def slash_role(interaction:discord.Interaction,member:discord.Member,role:
         if not assignable:
             return await interaction.response.send_message("Du hast keine Rollen, die du vergeben kannst.", ephemeral=True)
         view = RoleMultiSelectView(interaction.user, member)
-        await interaction.response.send_message(f"Wähle die Rollen aus, die du für {member.mention} hinzufügen oder entfernen möchtest (läuft in 60s ab):", view=view)
+        note = f" ({len(assignable)} Rollen insgesamt — nutze 🔍 Suchen, falls eine fehlt)" if len(assignable) > 25 else ""
+        await interaction.response.send_message(f"Wähle die Rollen aus, die du für {member.mention} hinzufügen oder entfernen möchtest{note}:", view=view)
         view.message = await interaction.original_response()
         return
     if role>=interaction.guild.me.top_role: return await interaction.response.send_message("Diese Rolle ist gleich oder höher als meine höchste Rolle.",ephemeral=True)
@@ -2399,33 +2481,59 @@ async def bot_edit_cmd(interaction:discord.Interaction,name:str=None,avatar_url:
         await interaction.followup.send(" | ".join(parts),ephemeral=True)
     except Exception as e: await interaction.followup.send(f"Fehler: {e}",ephemeral=True)
 
-@bot.tree.command(name="send",description="Nachricht als Bot senden (Embed, Bild, Link-Button).",guild=discord.Object(id=ALLOWED_GUILD_ID))
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # Discord's default non-boosted upload limit
+
+async def _download_as_file(url: str, fallback_name: str) -> discord.File:
+    """Downloads a URL and wraps it as a discord.File so Discord renders a
+    real inline player/preview (embeds can't do that for arbitrary video
+    files — only images/gifs work via set_image)."""
+    async with aiohttp.ClientSession() as s:
+        async with s.get(url, timeout=aiohttp.ClientTimeout(total=30)) as r:
+            if r.status != 200:
+                raise RuntimeError(f"HTTP {r.status}")
+            data = await r.read()
+            if len(data) > MAX_UPLOAD_BYTES:
+                raise RuntimeError("Datei ist größer als 25MB — Discord erlaubt keinen Upload dieser Größe. Verlinke die Datei stattdessen direkt im Nachrichtentext.")
+            ext = url.split("?")[0].rsplit(".", 1)[-1][:5] if "." in url.split("?")[0] else "bin"
+            return discord.File(io.BytesIO(data), filename=f"{fallback_name}.{ext}")
+
+@bot.tree.command(name="send",description="Nachricht als Bot senden (Embed, Bild, Video, Link-Button).",guild=discord.Object(id=ALLOWED_GUILD_ID))
 async def send_cmd(interaction:discord.Interaction,channel:discord.TextChannel,message:str,
     embed:bool=True,color:str="black",image:bool=False,image_url:str=None,
+    video:bool=False,video_url:str=None,
     link_button:bool=False,link_url:str=None,link_label:str="Öffnen"):
     if interaction.user.id not in OWNERS: return await interaction.response.send_message("Keine Berechtigung.",ephemeral=True)
     if image and not image_url: return await interaction.response.send_message("Bitte `image_url` angeben wenn `image` aktiviert ist.",ephemeral=True)
+    if video and not video_url: return await interaction.response.send_message("Bitte `video_url` angeben wenn `video` aktiviert ist.",ephemeral=True)
     if link_button and not link_url: return await interaction.response.send_message("Bitte `link_url` angeben wenn `link_button` aktiviert ist.",ephemeral=True)
     v=discord.ui.View()
     if link_button and link_url:
         v.add_item(discord.ui.Button(label=link_label,url=link_url,style=discord.ButtonStyle.link))
     v.add_item(TranslateButton(text=message))
+    # Allow real pings here — the bot's global default blocks all mentions,
+    # so /send explicitly re-enables @everyone/@here/@role/@user.
+    pings=discord.AllowedMentions(everyone=True,users=True,roles=True,replied_user=False)
+    await interaction.response.defer(ephemeral=True)
+    files=[]
     try:
+        if video and video_url:
+            files.append(await _download_as_file(video_url, "video"))
         if embed:
             emb=discord.Embed(description=message,color=parse_color(color))
             if image and image_url: emb.set_image(url=image_url)
-            await channel.send(embed=emb,view=v)
+            await channel.send(embed=emb,view=v,allowed_mentions=pings,files=files)
         else:
             content=f"{message}\n{image_url}" if image and image_url else message
-            await channel.send(content,view=v)
-        await interaction.response.send_message("Nachricht gesendet.",ephemeral=True)
-    except Exception as e: await interaction.response.send_message(f"Fehler: {e}",ephemeral=True)
+            await channel.send(content,view=v,allowed_mentions=pings,files=files)
+        await interaction.followup.send("Nachricht gesendet.",ephemeral=True)
+    except Exception as e: await interaction.followup.send(f"Fehler: {e}",ephemeral=True)
 
 @bot.tree.command(name="say",description="Nachricht als Bot senden (Nur Text).",guild=discord.Object(id=ALLOWED_GUILD_ID))
 async def say_cmd(interaction:discord.Interaction,channel:discord.TextChannel,text:str):
     if interaction.user.id not in OWNERS: return await interaction.response.send_message("Keine Berechtigung.",ephemeral=True)
     try:
-        await channel.send(text); await interaction.response.send_message("Nachricht gesendet.",ephemeral=True)
+        pings=discord.AllowedMentions(everyone=True,users=True,roles=True,replied_user=False)
+        await channel.send(text,allowed_mentions=pings); await interaction.response.send_message("Nachricht gesendet.",ephemeral=True)
     except discord.Forbidden: await interaction.response.send_message("Keine Berechtigung in diesem Kanal.",ephemeral=True)
     except Exception as e: await interaction.response.send_message(f"Fehler: {e}",ephemeral=True)
 
